@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: Arial, sans-serif; padding: 15px; color: #333; }
+    p { margin-top: 0; font-size: 14px; }
+    .format-example {
+      background: #f5f5f5;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 8px 10px;
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+      white-space: pre;
+      overflow-x: auto;
+      margin-bottom: 10px;
+      color: #444;
+    }
+    .rule {
+      background: #FCE5CD;
+      border-left: 4px solid #E69138;
+      padding: 8px 10px;
+      font-size: 12px;
+      margin-bottom: 12px;
+    }
+    .hint { font-size: 12px; color: #666; margin-bottom: 15px; }
+    .row { display: flex; gap: 12px; }
+    .row > div { flex: 1; }
+    label { font-size: 13px; font-weight: bold; }
+    input[type="text"], input[type="date"] {
+      width: 100%;
+      padding: 8px;
+      margin: 4px 0 15px;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    textarea {
+      width: 100%;
+      height: 150px;
+      margin-bottom: 15px;
+      padding: 8px;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      white-space: pre;
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+    }
+    button {
+      padding: 10px 20px;
+      background: #0B1F33;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    button:hover { background: #1a3a5c; }
+    button:disabled { background: #888; cursor: default; }
+    #status { margin-top: 15px; font-weight: bold; font-size: 14px; white-space: normal; }
+  </style>
+</head>
+<body>
+  <p>Fill in section 4 of the <b>BulkActionTemplates</b> tab, then copy it from the "Event Name" header down to the last invitee (headers included) and paste it below. Expected layout:</p>
+  <div class="format-example">Event Name	Event Date	Venue
+Sushi Night	2026-07-11	Dorm A Lounge
+
+Invited ID	Dorm	Attended?
+2025B638	Dorm B	TRUE
+2025B639	Dorm B	FALSE
+2026M711	Dorm A	TRUE</div>
+
+  <div class="rule">Only residents ticked as <b>Attended</b> get +1 Events Attended and +1 Eligible Events. Invited no-shows and everyone who wasn't invited are not affected.</div>
+
+  <p class="hint">Haven't held the event yet, or don't know who came? Leave every box unticked (or leave out the Attended? column) &mdash; you can tick column B on the new event tab later and the dashboard updates as you tick. A plain list of IDs works too, as long as you fill in the Event Name and Event Date boxes.</p>
+
+  <div class="row">
+    <div>
+      <label>Event Name <span style="font-weight: normal;">(optional if in paste)</span></label>
+      <input type="text" id="eventName" placeholder="e.g., Sushi Night">
+    </div>
+    <div>
+      <label>Event Date <span style="font-weight: normal;">(optional if in paste)</span></label>
+      <input type="date" id="eventDate">
+    </div>
+  </div>
+
+  <label>Paste Invite List:</label>
+  <textarea id="rawData" placeholder="Paste your table here, tabs and all..."></textarea>
+
+  <button id="submitBtn" onclick="submitData()">Create Invite-Only Event</button>
+  <div id="status"></div>
+
+  <script>
+    function submitData() {
+      const name = document.getElementById('eventName').value;
+      const date = document.getElementById('eventDate').value; // yyyy-mm-dd or ''
+      const data = document.getElementById('rawData').value;
+      const btn = document.getElementById('submitBtn');
+      const statusDiv = document.getElementById('status');
+
+      if (!data.trim()) {
+        statusDiv.style.color = '';
+        statusDiv.innerText = 'Please paste the invite list first.';
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerText = 'Creating...';
+      statusDiv.style.color = '';
+      statusDiv.innerText = '';
+
+      google.script.run
+        .withSuccessHandler(msg => {
+          statusDiv.style.color = 'green';
+          statusDiv.innerHTML = msg;
+          btn.innerText = 'Done';
+        })
+        .withFailureHandler(err => {
+          statusDiv.style.color = '';
+          statusDiv.innerHTML = '<span style="color:red">Error: ' + err.message + '</span>';
+          btn.disabled = false;
+          btn.innerText = 'Create Invite-Only Event';
+        })
+        .processInviteOnlyEventImport(name, date, data);
+    }
+  </script>
+</body>
+</html>

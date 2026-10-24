@@ -3,6 +3,31 @@
 /**
  * KUAS Dormitory Attendance Tracker
  * Google Apps Script bound to the attendance Google Sheet.
+ * v7.0: NEW - Invite-Only events (small events where only specific residents
+ *       are invited).
+ *       - New menu item: Events -> Import Invite-Only Event (Tick Attendance),
+ *         backed by a new dialog file ImportInviteOnlyEvent.html, plus a new
+ *         section 4 on BulkActionTemplates (Invited ID | Dorm | Attended?
+ *         with checkboxes) to fill in and copy-paste from.
+ *       - The generated event tab lists every invited resident in column A
+ *         with an "Attended?" checkbox in column B. Boxes can be ticked in
+ *         the template before pasting, or later on the event tab itself
+ *         (ticking a box auto-refreshes, same as typing an ID does).
+ *       - Counting rule: an invite-only event counts toward a resident's
+ *         Events Attended AND Eligible Events ONLY if their box is ticked.
+ *         Invited no-shows and everyone who wasn't invited are untouched, so
+ *         a small event can only ever raise someone's Attendance %, never
+ *         drag down the whole building's numbers. Dorm scope (E6) is ignored
+ *         for these events - the invite list is the scope.
+ *       - Under the hood: EventLog gets a 7th column (G, "Event Type") and
+ *         AttendanceLog a 10th (J, "Event Type"). Regular events leave it
+ *         blank. The Eligible Events formula now skips invite-only events in
+ *         EventLog and instead adds one per ticked invite-only attendance.
+ *         Existing data needs no migration - blank = regular event.
+ *       - An event tab is invite-only when B6 reads "Invite-Only" (A6 is
+ *         labelled "Event Type"). Regular event tabs leave A6:B6 empty.
+ *       - Data Audit also flags past invite-only events with nothing ticked.
+ *
  * v6.9: PRIVACY - reduced the Google permissions this script asks for.
  *       - Added the @OnlyCurrentDoc annotation (first line of this file).
  *         The script now only gets access to THIS spreadsheet, instead of
@@ -130,6 +155,15 @@
  * 5. Reload the Sheet.
  * 6. Run Dorm Attendance -> Maintenance -> Setup / Repair Workbook once.
  *
+ * Upgrading from v6.9 to v7.0 (one time only):
+ * a. Paste this file into Code.gs (replace everything).
+ * b. In the Apps Script editor click + -> HTML, name it exactly
+ *    ImportInviteOnlyEvent (no .html), and paste that file's contents in.
+ * c. Save, reload the Sheet, run Maintenance -> Setup / Repair Workbook once.
+ *    That adds the new log columns, updates every Eligible Events formula,
+ *    and appends section 4 to BulkActionTemplates without touching anything
+ *    already typed there.
+ *
  * Upgrading from v6.8 or earlier (one time only):
  * a. In the Apps Script editor, open Triggers (clock icon on the left) and
  *    delete the old "handleAttendanceEdit" and "handleSpreadsheetChange"
@@ -160,6 +194,18 @@ const ATTENDEE_START_ROW = 8;
 const ATTENDEE_COL = 1; // Column A
 const MAX_EVENT_ID_NUMBER = 99; // The sequence part of the Event ID is kept to 2 digits (...-01 to ...-99).
 
+// v7.0: invite-only events.
+const INVITE_ONLY_TYPE = 'Invite-Only';     // Value of B6 on an invite-only event tab, and of the Event Type log columns.
+const INVITE_ATTENDED_COL = 2;              // Column B - the "Attended?" checkbox on invite-only event tabs.
+const INVITE_CHECKBOX_BUFFER_ROWS = 30;     // Spare checkbox rows below the invite list for late additions.
+const INVITE_TEMPLATE_TITLE = '4. Import Invite-Only Event  \u2014  Events -> Import Invite-Only Event (Tick Attendance)';
+
+// v7.0: one place for the log layouts (EventLog gained G, AttendanceLog gained J).
+const EVENT_LOG_HEADERS = ['Event ID', 'Event Name', 'Event Date', 'Sheet Name', 'Created At', 'Applies To', 'Event Type'];
+const ATTENDANCE_LOG_HEADERS = ['Record ID', 'Event ID', 'Event Date', 'Event Name', 'Student ID', 'Dorm', 'Event Sheet', 'Logged At', 'Applies To', 'Event Type'];
+const EVENT_LOG_COLS = EVENT_LOG_HEADERS.length;           // 7
+const ATTENDANCE_LOG_COLS = ATTENDANCE_LOG_HEADERS.length; // 10
+
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
 
@@ -176,6 +222,7 @@ function onOpen() {
   const eventsMenu = ui.createMenu('Events')
     .addItem('Create New Event Sheet', 'createNewEventSheet')
     .addItem('Import Event with Attendance Details', 'openImportEventDialog')
+    .addItem('Import Invite-Only Event (Tick Attendance)', 'openImportInviteOnlyDialog')
     .addSeparator()
     .addItem('Refresh Attendance Log', 'refreshAttendanceLog')
     .addItem('Repair Event Sheet Formulas', 'repairEventSheetFormulas')
@@ -557,7 +604,7 @@ function archiveAttendanceForStudent_(studentId) {
   const attSh = ss.getSheetByName(ATTENDANCE_LOG_SHEET);
   if (!attSh || attSh.getLastRow() < 2) return;
 
-  const data = attSh.getRange(2, 1, attSh.getLastRow() - 1, 9).getValues();
+  const data = attSh.getRange(2, 1, attSh.getLastRow() - 1, ATTENDANCE_LOG_COLS).getValues();
   const keep = [];
   const toArchive = [];
   data.forEach(r => {
@@ -567,19 +614,39 @@ function archiveAttendanceForStudent_(studentId) {
   if (!toArchive.length) return;
 
   const attArchive = ensureSheet_(ATTENDANCE_LOG_ARCHIVE_SHEET);
-  if (attArchive.getLastRow() < 1) {
-    attArchive.getRange('A1:I1').setValues([['Record ID', 'Event ID', 'Event Date', 'Event Name', 'Student ID', 'Dorm', 'Event Sheet', 'Logged At', 'Applies To']]);
-    styleHeader_(attArchive.getRange('A1:I1'));
+  ensureAttendanceArchiveHeader_(attArchive);
+
+  attArchive.getRange(attArchive.getLastRow() + 1, 1, toArchive.length, ATTENDANCE_LOG_COLS).setValues(toArchive);
+  attSh.getRange(2, 1, attSh.getMaxRows() - 1, ATTENDANCE_LOG_COLS).clearContent();
+  if (keep.length) attSh.getRange(2, 1, keep.length, ATTENDANCE_LOG_COLS).setValues(keep);
+}
+
+/**
+ * v7.0: shared header setup for the two archive sheets. Writes the full,
+ * current header row every time (harmless - existing column names are
+ * unchanged, only new ones get added on the right), so archives created by
+ * older versions pick up "Applies To" / "Event Type" automatically.
+ */
+function ensureAttendanceArchiveHeader_(attArchive) {
+  const isNew = attArchive.getLastRow() < 1;
+  attArchive.getRange(1, 1, 1, ATTENDANCE_LOG_COLS).setValues([ATTENDANCE_LOG_HEADERS]);
+  styleHeader_(attArchive.getRange(1, 1, 1, ATTENDANCE_LOG_COLS));
+  if (isNew) {
     attArchive.getRange('C:C').setNumberFormat('yyyy-mm-dd');
     attArchive.getRange('H:H').setNumberFormat('yyyy-mm-dd hh:mm');
     attArchive.setFrozenRows(1);
-  } else if (attArchive.getRange('I1').getValue() !== 'Applies To') {
-    attArchive.getRange('I1').setValue('Applies To');
   }
+}
 
-  attArchive.getRange(attArchive.getLastRow() + 1, 1, toArchive.length, 9).setValues(toArchive);
-  attSh.getRange(2, 1, attSh.getMaxRows() - 1, 9).clearContent();
-  if (keep.length) attSh.getRange(2, 1, keep.length, 9).setValues(keep);
+function ensureEventArchiveHeader_(evArchive) {
+  const isNew = evArchive.getLastRow() < 1;
+  evArchive.getRange(1, 1, 1, EVENT_LOG_COLS).setValues([EVENT_LOG_HEADERS]);
+  styleHeader_(evArchive.getRange(1, 1, 1, EVENT_LOG_COLS));
+  if (isNew) {
+    evArchive.getRange('C:C').setNumberFormat('yyyy-mm-dd');
+    evArchive.getRange('E:E').setNumberFormat('yyyy-mm-dd hh:mm');
+    evArchive.setFrozenRows(1);
+  }
 }
 
 function addDorm() {
@@ -716,24 +783,34 @@ function refreshAttendanceLogSilently_() {
     const eventId = String(sheet.getRange('B3').getValue()).trim();
     const eventDate = sheet.getRange('B4').getValue();
     const eventName = String(sheet.getRange('B5').getValue()).trim();
-    const dormScope = normalizeDormScope_(sheet.getRange('E6').getValue());
     const sheetName = sheet.getName();
+
+    // v7.0: invite-only tabs ignore the dorm scope (the invite list IS the
+    // scope) and only log residents whose "Attended?" box is ticked.
+    const inviteOnly = isInviteOnlySheet_(sheet);
+    const dormScope = inviteOnly ? '' : normalizeDormScope_(sheet.getRange('E6').getValue());
+    const eventType = inviteOnly ? INVITE_ONLY_TYPE : '';
 
     if (!eventId || !(eventDate instanceof Date) || !eventName) {
       warnings.push(sheetName + ': missing Event ID, Event Date, or Event Name.');
       return;
     }
 
-    eventRows.push([eventId, eventName, eventDate, sheetName, now, dormScope]);
+    eventRows.push([eventId, eventName, eventDate, sheetName, now, dormScope, eventType]);
 
     const lastRow = Math.max(sheet.getLastRow(), ATTENDEE_START_ROW);
     const numRows = lastRow - ATTENDEE_START_ROW + 1;
-    const ids = sheet.getRange(ATTENDEE_START_ROW, ATTENDEE_COL, numRows, 1).getValues().flat();
+    const numCols = inviteOnly ? INVITE_ATTENDED_COL - ATTENDEE_COL + 1 : 1;
+    const block = sheet.getRange(ATTENDEE_START_ROW, ATTENDEE_COL, numRows, numCols).getValues();
     const seenInEvent = {};
 
-    ids.forEach(raw => {
-      const studentId = normalizeId_(raw);
-      if (!studentId || seenInEvent[studentId]) return;
+    block.forEach(r => {
+      const studentId = normalizeId_(r[0]);
+      if (!studentId) return;
+      // Unticked invitees are skipped BEFORE being marked as seen, so if the
+      // same ID is listed twice and only one copy is ticked, it still counts.
+      if (inviteOnly && !isTicked_(r[INVITE_ATTENDED_COL - ATTENDEE_COL])) return;
+      if (seenInEvent[studentId]) return;
       seenInEvent[studentId] = true;
 
       const reg = registry[studentId];
@@ -743,7 +820,7 @@ function refreshAttendanceLogSilently_() {
       }
 
       const recordId = eventId + '|' + studentId;
-      attendanceRows.push([recordId, eventId, eventDate, eventName, studentId, reg.dorm, sheetName, now, dormScope]);
+      attendanceRows.push([recordId, eventId, eventDate, eventName, studentId, reg.dorm, sheetName, now, dormScope, eventType]);
     });
   });
 
@@ -777,9 +854,24 @@ function refreshAttendanceLogSilently_() {
 function onEdit(e) {
   if (!e || !e.range) return;
   const sheet = e.range.getSheet();
-  if (!isEventSheet_(sheet)) return;
-  if (e.range.getColumn() > ATTENDEE_COL) return; // Only the Student ID column matters.
+  if (e.range.getColumn() > INVITE_ATTENDED_COL) return; // Only A (IDs) or B (invite-only ticks) can matter.
   if (e.range.getRow() + e.range.getNumRows() - 1 < ATTENDEE_START_ROW) return; // Ignore edits above the attendee list.
+  if (!isEventSheet_(sheet)) return;
+
+  // v7.0: on invite-only tabs, ticking/unticking the "Attended?" box in
+  // column B also triggers a refresh. On regular tabs only column A matters.
+  const inviteOnly = isInviteOnlySheet_(sheet);
+  if (!inviteOnly && e.range.getColumn() > ATTENDEE_COL) return;
+
+  // If someone types/pastes a late invitee into column A, make sure that row
+  // has an "Attended?" checkbox too (adds the checkbox rule only - never
+  // changes an existing tick).
+  if (inviteOnly && e.range.getColumn() === ATTENDEE_COL) {
+    const firstRow = Math.max(e.range.getRow(), ATTENDEE_START_ROW);
+    const lastRow = e.range.getRow() + e.range.getNumRows() - 1;
+    applyInviteCheckboxes_(sheet, firstRow, lastRow - firstRow + 1);
+  }
+
   refreshAttendanceLogSilently_();
 }
 
@@ -859,7 +951,7 @@ function applyDormRowFormulas_(sh, numRows) {
     const row = 5 + i;
     formulas.push([
       '=IF($A' + row + '="","",SUMPRODUCT((AttendanceLog!$E$2:$E$5000=$A' + row + ')*(AttendanceLog!$C$2:$C$5000>=MAX($D' + row + ',Settings!$B$3))*((AttendanceLog!$I$2:$I$5000="")+(IFERROR(SEARCH(","&$C' + row + '&",",","&AttendanceLog!$I$2:$I$5000&","),0)>0))))',
-      '=IF($A' + row + '="","",SUMPRODUCT((EventLog!$C$2:$C$5000>=MAX($D' + row + ',Settings!$B$3))*(EventLog!$C$2:$C$5000<=TODAY())*((EventLog!$F$2:$F$5000="")+(IFERROR(SEARCH(","&$C' + row + '&",",","&EventLog!$F$2:$F$5000&","),0)>0))))',
+      eligibleEventsFormula_(row, 'D'),
       '=IFERROR(E' + row + '/F' + row + ',0)',
       '=IFERROR(MAX(FILTER(AttendanceLog!$C:$C,AttendanceLog!$E:$E=$A' + row + ',(AttendanceLog!$I:$I="")+(IFERROR(SEARCH(","&$C' + row + '&",",","&AttendanceLog!$I:$I&","),0)>0))),"")'
     ]);
@@ -868,6 +960,36 @@ function applyDormRowFormulas_(sh, numRows) {
   sh.getRange(5, 4, numRows, 1).setNumberFormat('yyyy-mm-dd');
   sh.getRange(5, 7, numRows, 1).setNumberFormat('0.0%');
   sh.getRange(5, 8, numRows, 1).setNumberFormat('yyyy-mm-dd');
+}
+
+/**
+ * v7.0: the Eligible Events formula, shared by the dorm sheets (start date in
+ * column D) and StudentRegistry (start date in column E). Student ID is
+ * always column A and dorm is always column C on both.
+ *
+ * Two parts added together:
+ *  1. Regular events - same as v6.2: every EventLog event on/after the
+ *     student's start (and the academic-year start), not in the future, in
+ *     their dorm scope - but now EXCLUDING invite-only events (EventLog!G).
+ *  2. Invite-only events - one per AttendanceLog row for this student whose
+ *     Event Type (AttendanceLog!J) is invite-only, using the same date floor
+ *     as Events Attended. AttendanceLog only ever holds ticked invitees, so
+ *     an invite-only event becomes "eligible" exactly when it's "attended" -
+ *     Attendance % can't exceed 100% and no-shows aren't penalised.
+ */
+function eligibleEventsFormula_(row, startCol) {
+  const floor = 'MAX($' + startCol + row + ',Settings!$B$3)';
+  const t = '"' + INVITE_ONLY_TYPE + '"';
+  const regular =
+    'SUMPRODUCT((EventLog!$C$2:$C$5000>=' + floor + ')' +
+    '*(EventLog!$C$2:$C$5000<=TODAY())' +
+    '*(EventLog!$G$2:$G$5000<>' + t + ')' +
+    '*((EventLog!$F$2:$F$5000="")+(IFERROR(SEARCH(","&$C' + row + '&",",","&EventLog!$F$2:$F$5000&","),0)>0)))';
+  const inviteOnly =
+    'SUMPRODUCT((AttendanceLog!$E$2:$E$5000=$A' + row + ')' +
+    '*(AttendanceLog!$C$2:$C$5000>=' + floor + ')' +
+    '*(AttendanceLog!$J$2:$J$5000=' + t + '))';
+  return '=IF($A' + row + '="","",' + regular + '+' + inviteOnly + ')';
 }
 
 /**
@@ -890,7 +1012,7 @@ function applyRegistryStatsFormulas_() {
     const row = 2 + i;
     formulas.push([
       '=IF($A' + row + '="","",SUMPRODUCT((AttendanceLog!$E$2:$E$5000=$A' + row + ')*(AttendanceLog!$C$2:$C$5000>=MAX($E' + row + ',Settings!$B$3))*((AttendanceLog!$I$2:$I$5000="")+(IFERROR(SEARCH(","&$C' + row + '&",",","&AttendanceLog!$I$2:$I$5000&","),0)>0))))',
-      '=IF($A' + row + '="","",SUMPRODUCT((EventLog!$C$2:$C$5000>=MAX($E' + row + ',Settings!$B$3))*(EventLog!$C$2:$C$5000<=TODAY())*((EventLog!$F$2:$F$5000="")+(IFERROR(SEARCH(","&$C' + row + '&",",","&EventLog!$F$2:$F$5000&","),0)>0))))',
+      eligibleEventsFormula_(row, 'E'),
       '=IFERROR(G' + row + '/H' + row + ',0)',
       '=IFERROR(MAX(FILTER(AttendanceLog!$C:$C,AttendanceLog!$E:$E=$A' + row + ',(AttendanceLog!$I:$I="")+(IFERROR(SEARCH(","&$C' + row + '&",",","&AttendanceLog!$I:$I&","),0)>0))),"")'
     ]);
@@ -969,21 +1091,40 @@ function runDataAudit() {
   }
 
   // 3. Event sheet attendee checks: duplicates within a sheet, IDs missing from the registry.
+  //    v7.0: on invite-only tabs, also flag a past event with nothing ticked
+  //    (almost always means someone forgot to tick the boxes).
   const registry = getRegistryMap_();
+  const today = new Date();
   ss.getSheets().forEach(sheet => {
     if (!isEventSheet_(sheet)) return;
+    const inviteOnly = isInviteOnlySheet_(sheet);
     const lastRow = Math.max(sheet.getLastRow(), ATTENDEE_START_ROW);
     const numRows = lastRow - ATTENDEE_START_ROW + 1;
-    const ids = sheet.getRange(ATTENDEE_START_ROW, ATTENDEE_COL, numRows, 1).getValues().flat();
+    const numCols = inviteOnly ? INVITE_ATTENDED_COL - ATTENDEE_COL + 1 : 1;
+    const block = sheet.getRange(ATTENDEE_START_ROW, ATTENDEE_COL, numRows, numCols).getValues();
     const seenInSheet = {};
-    ids.forEach((raw, i) => {
-      const id = normalizeId_(raw);
+    let invited = 0;
+    let ticked = 0;
+    block.forEach((r, i) => {
+      const id = normalizeId_(r[0]);
       if (!id) return;
       const row = ATTENDEE_START_ROW + i;
-      if (seenInSheet[id]) issues.push([sheet.getName(), row, 'Duplicate attendee entry: ' + id]);
+      const label = inviteOnly ? 'invitee' : 'attendee';
+      if (seenInSheet[id]) issues.push([sheet.getName(), row, 'Duplicate ' + label + ' entry: ' + id]);
       seenInSheet[id] = true;
-      if (!registry[id]) issues.push([sheet.getName(), row, 'Attendee not found in registry: ' + id]);
+      if (!registry[id]) issues.push([sheet.getName(), row, (inviteOnly ? 'Invitee' : 'Attendee') + ' not found in registry: ' + id]);
+      if (inviteOnly) {
+        invited++;
+        if (isTicked_(r[INVITE_ATTENDED_COL - ATTENDEE_COL])) ticked++;
+      }
     });
+    if (inviteOnly) {
+      const eventDate = sheet.getRange('B4').getValue();
+      if (invited && !ticked && eventDate instanceof Date && eventDate <= today) {
+        issues.push([sheet.getName(), ATTENDEE_START_ROW,
+          'Invite-only event with ' + invited + ' invitee(s) but no "Attended?" boxes ticked - nobody is being counted for it yet. Tick column B for everyone who came.']);
+      }
+    }
   });
 
   // 4. Attendance recorded before the student's own registered Start Date.
@@ -1052,24 +1193,8 @@ function archivePreviousYearEvents() {
   const evArchive = ensureSheet_(EVENT_LOG_ARCHIVE_SHEET);
   const attArchive = ensureSheet_(ATTENDANCE_LOG_ARCHIVE_SHEET);
 
-  if (evArchive.getLastRow() < 1) {
-    evArchive.getRange('A1:F1').setValues([['Event ID', 'Event Name', 'Event Date', 'Sheet Name', 'Created At', 'Applies To']]);
-    styleHeader_(evArchive.getRange('A1:F1'));
-    evArchive.getRange('C:C').setNumberFormat('yyyy-mm-dd');
-    evArchive.getRange('E:E').setNumberFormat('yyyy-mm-dd hh:mm');
-    evArchive.setFrozenRows(1);
-  } else if (evArchive.getRange('F1').getValue() !== 'Applies To') {
-    evArchive.getRange('F1').setValue('Applies To');
-  }
-  if (attArchive.getLastRow() < 1) {
-    attArchive.getRange('A1:I1').setValues([['Record ID', 'Event ID', 'Event Date', 'Event Name', 'Student ID', 'Dorm', 'Event Sheet', 'Logged At', 'Applies To']]);
-    styleHeader_(attArchive.getRange('A1:I1'));
-    attArchive.getRange('C:C').setNumberFormat('yyyy-mm-dd');
-    attArchive.getRange('H:H').setNumberFormat('yyyy-mm-dd hh:mm');
-    attArchive.setFrozenRows(1);
-  } else if (attArchive.getRange('I1').getValue() !== 'Applies To') {
-    attArchive.getRange('I1').setValue('Applies To');
-  }
+  ensureEventArchiveHeader_(evArchive);
+  ensureAttendanceArchiveHeader_(attArchive);
 
   let archivedEvents = 0;
   let archivedAttendance = 0;
@@ -1077,7 +1202,7 @@ function archivePreviousYearEvents() {
   const archivedSheetNames = {};
 
   if (evSh && evSh.getLastRow() > 1) {
-    const data = evSh.getRange(2, 1, evSh.getLastRow() - 1, 6).getValues();
+    const data = evSh.getRange(2, 1, evSh.getLastRow() - 1, EVENT_LOG_COLS).getValues();
     const keep = [];
     const toArchive = [];
     data.forEach(r => {
@@ -1090,15 +1215,15 @@ function archivePreviousYearEvents() {
       }
     });
     if (toArchive.length) {
-      evArchive.getRange(evArchive.getLastRow() + 1, 1, toArchive.length, 6).setValues(toArchive);
+      evArchive.getRange(evArchive.getLastRow() + 1, 1, toArchive.length, EVENT_LOG_COLS).setValues(toArchive);
       archivedEvents = toArchive.length;
-      evSh.getRange(2, 1, evSh.getMaxRows() - 1, 6).clearContent();
-      if (keep.length) evSh.getRange(2, 1, keep.length, 6).setValues(keep);
+      evSh.getRange(2, 1, evSh.getMaxRows() - 1, EVENT_LOG_COLS).clearContent();
+      if (keep.length) evSh.getRange(2, 1, keep.length, EVENT_LOG_COLS).setValues(keep);
     }
   }
 
   if (attSh && attSh.getLastRow() > 1 && Object.keys(archivedEventIds).length) {
-    const data = attSh.getRange(2, 1, attSh.getLastRow() - 1, 9).getValues();
+    const data = attSh.getRange(2, 1, attSh.getLastRow() - 1, ATTENDANCE_LOG_COLS).getValues();
     const keep = [];
     const toArchive = [];
     data.forEach(r => {
@@ -1106,10 +1231,10 @@ function archivePreviousYearEvents() {
       else keep.push(r);
     });
     if (toArchive.length) {
-      attArchive.getRange(attArchive.getLastRow() + 1, 1, toArchive.length, 9).setValues(toArchive);
+      attArchive.getRange(attArchive.getLastRow() + 1, 1, toArchive.length, ATTENDANCE_LOG_COLS).setValues(toArchive);
       archivedAttendance = toArchive.length;
-      attSh.getRange(2, 1, attSh.getMaxRows() - 1, 9).clearContent();
-      if (keep.length) attSh.getRange(2, 1, keep.length, 9).setValues(keep);
+      attSh.getRange(2, 1, attSh.getMaxRows() - 1, ATTENDANCE_LOG_COLS).clearContent();
+      if (keep.length) attSh.getRange(2, 1, keep.length, ATTENDANCE_LOG_COLS).setValues(keep);
     }
   }
 
@@ -1157,7 +1282,7 @@ function pruneOrphanedEventLogEntries_() {
   const existingSheetNames = {};
   ss.getSheets().forEach(s => existingSheetNames[s.getName()] = true);
 
-  const data = evSh.getRange(2, 1, evSh.getLastRow() - 1, 6).getValues();
+  const data = evSh.getRange(2, 1, evSh.getLastRow() - 1, EVENT_LOG_COLS).getValues();
   const keptRows = [];
   const removedEventIds = {};
   data.forEach(r => {
@@ -1171,15 +1296,15 @@ function pruneOrphanedEventLogEntries_() {
 
   if (!Object.keys(removedEventIds).length) return;
 
-  evSh.getRange(2, 1, evSh.getMaxRows() - 1, 6).clearContent();
-  if (keptRows.length) evSh.getRange(2, 1, keptRows.length, 6).setValues(keptRows);
+  evSh.getRange(2, 1, evSh.getMaxRows() - 1, EVENT_LOG_COLS).clearContent();
+  if (keptRows.length) evSh.getRange(2, 1, keptRows.length, EVENT_LOG_COLS).setValues(keptRows);
 
   const attSh = ss.getSheetByName(ATTENDANCE_LOG_SHEET);
   if (attSh && attSh.getLastRow() > 1) {
-    const attData = attSh.getRange(2, 1, attSh.getLastRow() - 1, 9).getValues();
+    const attData = attSh.getRange(2, 1, attSh.getLastRow() - 1, ATTENDANCE_LOG_COLS).getValues();
     const keptAtt = attData.filter(r => !removedEventIds[String(r[1]).trim()]);
-    attSh.getRange(2, 1, attSh.getMaxRows() - 1, 9).clearContent();
-    if (keptAtt.length) attSh.getRange(2, 1, keptAtt.length, 9).setValues(keptAtt);
+    attSh.getRange(2, 1, attSh.getMaxRows() - 1, ATTENDANCE_LOG_COLS).clearContent();
+    if (keptAtt.length) attSh.getRange(2, 1, keptAtt.length, ATTENDANCE_LOG_COLS).setValues(keptAtt);
   }
 
   rebuildDormSummarySheets();
@@ -1634,6 +1759,273 @@ function openImportEventDialog() {
   SpreadsheetApp.getUi().showModalDialog(html, 'Import Old Event Records');
 }
 
+// ---------------------------------------------------------------------------
+// v7.0: Invite-only events
+// ---------------------------------------------------------------------------
+
+function openImportInviteOnlyDialog() {
+  const html = HtmlService.createHtmlOutputFromFile('ImportInviteOnlyEvent')
+    .setWidth(640)
+    .setHeight(600);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Import Invite-Only Event');
+}
+
+/**
+ * Entry point called from ImportInviteOnlyEvent.html.
+ *
+ * Expected paste (copied from BulkActionTemplates section 4, headers included):
+ *   Event Name   Event Date   Venue
+ *   Sushi Night  2026-07-11   Dorm A Lounge
+ *
+ *   Invited ID   Dorm         Attended?
+ *   2025B638     Dorm B       TRUE
+ *   2025B639     Dorm B       FALSE
+ *
+ * The event-details block is optional if Event Name / Event Date are typed
+ * into the dialog instead (those boxes win when filled). The Dorm and
+ * Attended? columns are optional too - a bare list of IDs works, and
+ * everyone starts unticked so staff can tick on the event tab afterwards.
+ */
+function processInviteOnlyEventImport(eventNameOverride, eventDateOverride, rawText) {
+  if (!rawText || !rawText.trim()) {
+    throw new Error('Please paste the invite list first.');
+  }
+
+  const data = parseInviteOnlyImport_(rawText);
+
+  if (eventNameOverride && String(eventNameOverride).trim()) {
+    data.eventName = String(eventNameOverride).trim();
+  }
+  if (eventDateOverride && String(eventDateOverride).trim()) {
+    const d = parseDate_(String(eventDateOverride).trim());
+    if (!d) throw new Error('Could not read the Event Date you typed. Use yyyy-mm-dd, e.g. 2026-07-11.');
+    data.eventDate = d;
+  }
+
+  if (!data.eventName) {
+    throw new Error('Could not find an event name. Include the "Event Name" header row in your paste, or type it into the Event Name box.');
+  }
+  if (!data.eventDate) {
+    throw new Error('Could not read the Event Date. Include the "Event Date" column in your paste (e.g. 2026-07-11), or pick it in the Event Date box.');
+  }
+  if (!data.invitees.length) {
+    throw new Error('No invited student IDs were found. Make sure the paste includes the "Invited ID" header row and the IDs below it.');
+  }
+
+  return createInviteOnlyEventSheet_(data);
+}
+
+/**
+ * Parses an invite-only paste. Returns
+ *   { eventName, eventDate, venue, invitees: [{id, dorm, attended}], duplicates, hasAttendedColumn }
+ * Never returns null - with no recognisable "Invited ID" header it falls back
+ * to treating every ID-looking first cell as an invitee.
+ */
+function parseInviteOnlyImport_(rawText) {
+  const rows = rawText.replace(/\r/g, '').split('\n').map(line => line.split('\t').map(c => c.trim()));
+
+  // 1. Optional event-details block ("Event Name | Event Date | Venue" + one data row).
+  let eventName = '';
+  let eventDate = null;
+  let venue = '';
+  let searchFrom = 0;
+  const headerIdx = rows.findIndex(cols => (cols[0] || '').toLowerCase() === 'event name');
+  if (headerIdx >= 0) {
+    const headers = rows[headerIdx].map(h => h.toLowerCase());
+    const dateCol = Math.max(headers.indexOf('event date'), 1);
+    const venueCol = headers.indexOf('venue') >= 0 ? headers.indexOf('venue') : 2;
+    let dataIdx = headerIdx + 1;
+    while (dataIdx < rows.length && rows[dataIdx].every(c => !c)) dataIdx++;
+    if (dataIdx < rows.length) {
+      const dr = rows[dataIdx];
+      eventName = dr[0] || '';
+      eventDate = parseDate_(dr[dateCol] || '');
+      venue = dr[venueCol] || '';
+      searchFrom = dataIdx + 1;
+    }
+  }
+
+  // 2. Invite list. Find its header row: first cell like "Invited ID",
+  //    "Invitee ID", "Attendee ID", "Student ID" or "Resident ID".
+  const idHeaderRe = /^(invited|invitee|attendee|student|resident)\s*id$/i;
+  let listHeaderIdx = -1;
+  for (let i = searchFrom; i < rows.length; i++) {
+    if (idHeaderRe.test(rows[i][0] || '')) { listHeaderIdx = i; break; }
+  }
+
+  const byId = {};
+  const order = [];
+  let duplicates = 0;
+  let hasAttendedColumn = false;
+  const addInvitee = (id, dorm, attended) => {
+    if (byId[id]) {
+      duplicates++;
+      byId[id].attended = byId[id].attended || attended; // ticked anywhere = ticked
+      if (!byId[id].dorm && dorm) byId[id].dorm = dorm;
+      return;
+    }
+    byId[id] = { id: id, dorm: dorm, attended: attended };
+    order.push(id);
+  };
+
+  if (listHeaderIdx >= 0) {
+    const headers = rows[listHeaderIdx];
+    let dormCol = -1;
+    let attCol = -1;
+    headers.forEach((h, c) => {
+      if (c === 0 || !h) return;
+      if (dormCol === -1 && /dorm/i.test(h)) { dormCol = c; return; }
+      if (attCol === -1 && /attend|came|present|show|tick|check|\u2713|\u2714/i.test(h)) attCol = c;
+    });
+    hasAttendedColumn = attCol >= 0;
+
+    for (let i = listHeaderIdx + 1; i < rows.length; i++) {
+      const id = normalizeId_(rows[i][0]);
+      if (!id || idHeaderRe.test(id)) continue;
+      const dorm = dormCol >= 0 ? (rows[i][dormCol] || '') : '';
+      const attended = attCol >= 0 ? isTicked_(rows[i][attCol]) : false;
+      addInvitee(id, dorm, attended);
+    }
+  } else {
+    // Fallback: no header row - any line whose first cell looks like a
+    // student ID (contains a digit, 5+ characters, no spaces) is an invitee.
+    // Any other cell that reads like a tick (TRUE / Yes / x / ✓) marks them
+    // attended; any cell matching a dorm name is kept as their pasted dorm.
+    const dormNames = getActiveDormNames_().concat(getInactiveDormNames_()).map(d => d.toLowerCase());
+    for (let i = searchFrom; i < rows.length; i++) {
+      const cells = rows[i];
+      const first = cells[0] || '';
+      if (!/\d/.test(first) || first.length < 5 || /\s/.test(first)) continue;
+      if (/^\d{1,4}[-\/.]\d{1,2}[-\/.]\d{1,4}$/.test(first)) continue; // a date, not an ID
+      const rest = cells.slice(1);
+      const dorm = rest.find(c => dormNames.indexOf(c.toLowerCase()) >= 0) || '';
+      const attended = rest.some(c => isTicked_(c));
+      if (attended) hasAttendedColumn = true;
+      addInvitee(normalizeId_(first), dorm, attended);
+    }
+  }
+
+  return {
+    eventName: eventName,
+    eventDate: eventDate,
+    venue: venue,
+    invitees: order.map(id => byId[id]),
+    duplicates: duplicates,
+    hasAttendedColumn: hasAttendedColumn
+  };
+}
+
+/** Builds the invite-only event tab from parsed data, logs it, refreshes, and returns an HTML status message for the dialog. */
+function createInviteOnlyEventSheet_(data) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const eventId = makeEventId_(data.eventDate);
+  const sheetNameBase = EVENT_PREFIX + Utilities.formatDate(data.eventDate, Session.getScriptTimeZone(), 'yyyyMMdd') + '_' + sanitizeSheetName_(data.eventName);
+  const sheetName = uniqueSheetName_(sheetNameBase.substring(0, 90));
+
+  let template = ss.getSheetByName(TEMPLATE_SHEET);
+  if (!template) {
+    setupEventTemplate_();
+    template = ss.getSheetByName(TEMPLATE_SHEET);
+  }
+
+  const newSheet = template.copyTo(ss).setName(sheetName);
+  ss.setActiveSheet(newSheet);
+  ss.moveActiveSheet(ss.getNumSheets());
+
+  newSheet.getRange('A1').setValue('Event Attendance Sheet (Invite-Only)');
+  newSheet.getRange('B3').setValue(eventId);
+  newSheet.getRange('B4').setValue(data.eventDate).setNumberFormat('yyyy-mm-dd');
+  newSheet.getRange('B5').setValue(data.eventName);
+  if (data.venue) newSheet.getRange('E3').setValue(data.venue);
+  applyEventSheetFormatting_(newSheet);
+  formatInviteOnlySheet_(newSheet, data.invitees.length);
+
+  if (data.invitees.length) {
+    const n = data.invitees.length;
+    newSheet.getRange(ATTENDEE_START_ROW, ATTENDEE_COL, n, 1).setValues(data.invitees.map(p => [p.id]));
+    newSheet.getRange(ATTENDEE_START_ROW, INVITE_ATTENDED_COL, n, 1).setValues(data.invitees.map(p => [p.attended === true]));
+    newSheet.getRange(ATTENDEE_START_ROW, 5, n, 1).setValues(data.invitees.map(p => [p.dorm ? 'Imported dorm: ' + p.dorm : '']));
+  }
+
+  upsertEventLog_(eventId, data.eventName, data.eventDate, sheetName, '', INVITE_ONLY_TYPE);
+
+  // Sync immediately - onEdit never fires for the script's own edits.
+  refreshAttendanceLogSilently_();
+
+  const registry = getRegistryMap_();
+  const ticked = data.invitees.filter(p => p.attended);
+  const unregisteredTicked = ticked.filter(p => !registry[p.id]).map(p => p.id);
+  const unregisteredUnticked = data.invitees.filter(p => !p.attended && !registry[p.id]).map(p => p.id);
+  const countedNow = ticked.length - unregisteredTicked.length;
+
+  let msg = `Success! Created invite-only sheet '${sheetName}' (Event ID ${eventId}).<br>` +
+    `Invited: ${data.invitees.length} &nbsp;|&nbsp; Ticked as attended: ${ticked.length} &nbsp;|&nbsp; Counted on the dashboard now: ${countedNow}`;
+  if (data.duplicates) {
+    msg += `<br>(${data.duplicates} duplicate invitee row(s) were merged.)`;
+  }
+  msg += '<br><br><span style="color:#333;font-weight:normal">Only ticked residents get +1 Events Attended and +1 Eligible Events. Invited no-shows and everyone who wasn\u2019t invited are unaffected.</span>';
+  if (!ticked.length) {
+    msg += '<br><br><span style="color:#cc7a00">Nobody is ticked yet. Open the new tab and tick the "Attended?" box (column B) for each resident who came - the dashboard updates as you tick.</span>';
+  }
+  if (unregisteredTicked.length) {
+    msg += `<br><br><span style="color:#cc7a00">Ticked but not in the registry, so not counted yet (register them, then run Refresh Attendance Log): ${unregisteredTicked.join(', ')}</span>`;
+  }
+  if (unregisteredUnticked.length) {
+    msg += `<br><br><span style="color:#cc7a00">Invited but not in the registry (will need registering before a tick counts): ${unregisteredUnticked.join(', ')}</span>`;
+  }
+  return msg;
+}
+
+/** Turns a freshly copied event tab into the invite-only layout (labels, Event Type marker, checkbox column, live counts). */
+function formatInviteOnlySheet_(sh, invitedCount) {
+  // Explanation banner in row 2 (unused on regular event tabs).
+  sh.getRange(2, 1, 1, 26).breakApart();
+  sh.getRange('A2:E2').merge()
+    .setValue('Invite-only event: list every invited resident in column A and tick "Attended?" for those who came. ' +
+      'Only ticked residents count toward Events Attended AND Eligible Events - unticked invitees and everyone else are unaffected.')
+    .setFontStyle('italic').setFontColor('#666666').setWrap(true).setVerticalAlignment('top');
+  sh.setRowHeight(2, 36);
+
+  // Event Type marker - this is what the rest of the script checks (isInviteOnlySheet_).
+  sh.getRange('A6:B6').setValues([['Event Type', INVITE_ONLY_TYPE]]);
+  sh.getRange('A6').setBackground('#D9EAF7').setFontWeight('bold');
+  sh.getRange('B6').setBackground('#FCE5CD').setFontWeight('bold');
+  sh.getRange('B6').setNote('Do not change. This marks the tab as invite-only: only rows ticked in column B are counted.');
+
+  // Live counts instead of typed numbers. D3 ("Venue") and D6 ("Applies To
+  // Dorm(s)") keep their labels so ensureEventSheetMetaLabels_ leaves this tab alone.
+  sh.getRange('D4:D5').setValues([['Invited'], ['Attended (ticked)']]);
+  sh.getRange('E4').setFormula('=COUNTA(A' + ATTENDEE_START_ROW + ':A)');
+  sh.getRange('E5').setFormula('=COUNTIF(B' + ATTENDEE_START_ROW + ':B,TRUE)');
+  sh.getRange('E4:E5').setBackground('#EFEFEF').setNumberFormat('0');
+  sh.getRange('E6').setValue('Invited residents only').setFontColor('#666666').setFontStyle('italic');
+  sh.getRange('E6').setNote('Ignored for invite-only events - the invite list in column A is the scope.');
+
+  sh.getRange('B7').setValue('Attended?');
+  sh.getRange('E7').setValue('Notes');
+  sh.getRange('B' + ATTENDEE_START_ROW + ':B1000').setBackground('#FCE5CD');
+  applyInviteCheckboxes_(sh, ATTENDEE_START_ROW, invitedCount + INVITE_CHECKBOX_BUFFER_ROWS);
+}
+
+/** Adds the "Attended?" checkbox rule to column B for the given rows. Rule only - existing ticks are never changed. */
+function applyInviteCheckboxes_(sh, startRow, numRows) {
+  if (!numRows || numRows < 1) return;
+  const rule = SpreadsheetApp.newDataValidation().requireCheckbox().build();
+  sh.getRange(startRow, INVITE_ATTENDED_COL, numRows, 1).setDataValidation(rule).setHorizontalAlignment('center');
+}
+
+/** True if this event tab is invite-only (B6 reads "Invite-Only"). Regular tabs have A6:B6 blank. */
+function isInviteOnlySheet_(sheet) {
+  return String(sheet.getRange('B6').getValue()).trim().toLowerCase() === INVITE_ONLY_TYPE.toLowerCase();
+}
+
+/** Reads a checkbox / pasted tick. TRUE from a real checkbox, or text like TRUE / Yes / Y / x / 1 / ✓ / Attended. */
+function isTicked_(v) {
+  if (v === true) return true;
+  if (v === false || v === null || v === undefined) return false;
+  return /^(true|yes|y|x|1|\u2713|\u2714|\u2611|attended|present|came)$/i.test(String(v).trim());
+}
+
 /** Rewrites the on-sheet workflow / quick-reference tables on the Dashboard so they match the current menu. Safe to re-run. */
 function refreshDashboardInstructions() {
   const sh = ensureSheet_(DASHBOARD_SHEET);
@@ -1644,7 +2036,7 @@ function refreshDashboardInstructions() {
   sh.getRange('A7').setValue('Student Staff Workflow');
   sh.getRange('A8:B13').setValues([
     [1, 'Open this shared Google Sheet.'],
-    [2, 'Dorm Attendance -> Events -> Create New Event Sheet (or Import Event to bulk-import an old paper list).'],
+    [2, 'Dorm Attendance -> Events -> Create New Event Sheet (or Import Event to bulk-import a list; Import Invite-Only Event for small invite-only events, then tick who came).'],
     [3, 'Enter the event name and event date when prompted.'],
     [4, 'Enter attendee student ID numbers in Column A of the generated event tab, starting at row 8.'],
     [5, 'Dorm Attendance -> Events -> Refresh Attendance Log.'],
@@ -1855,13 +2247,13 @@ function setupEventLog_() {
   // safer pattern already used by setupRegistry_().
   if (sh.getLastRow() === 0 || sh.getRange('A1').getValue() !== 'Event ID') {
     sh.clear();
-    sh.getRange('A1:F1').setValues([['Event ID', 'Event Name', 'Event Date', 'Sheet Name', 'Created At', 'Applies To']]);
-  } else if (sh.getRange('F1').getValue() !== 'Applies To') {
-    // Migration from v5 (no dorm-scoping column): add the header only, existing
-    // rows keep their data and get an "Applies To" value on the next refresh.
-    sh.getRange('F1').setValue('Applies To');
   }
-  styleHeader_(sh.getRange('A1:F1'));
+  // Migration from v5 (no "Applies To") and v6.x (no "Event Type"): (re)write
+  // the header row only - existing rows keep their data, and a blank Event
+  // Type simply means "regular event", which is correct for everything
+  // logged before v7.0.
+  sh.getRange(1, 1, 1, EVENT_LOG_COLS).setValues([EVENT_LOG_HEADERS]);
+  styleHeader_(sh.getRange(1, 1, 1, EVENT_LOG_COLS));
   sh.getRange('C:C').setNumberFormat('yyyy-mm-dd');
   sh.getRange('E:E').setNumberFormat('yyyy-mm-dd hh:mm');
   sh.setFrozenRows(1);
@@ -1873,12 +2265,10 @@ function setupAttendanceLog_() {
   // re-running Setup used to silently delete the entire attendance history.
   if (sh.getLastRow() === 0 || sh.getRange('A1').getValue() !== 'Record ID') {
     sh.clear();
-    sh.getRange('A1:I1').setValues([['Record ID', 'Event ID', 'Event Date', 'Event Name', 'Student ID', 'Dorm', 'Event Sheet', 'Logged At', 'Applies To']]);
-  } else if (sh.getRange('I1').getValue() !== 'Applies To') {
-    // Migration from v5: add the header only, keep existing rows as-is.
-    sh.getRange('I1').setValue('Applies To');
   }
-  styleHeader_(sh.getRange('A1:I1'));
+  // Migration from v5/v6.x: header row only, existing rows kept as-is.
+  sh.getRange(1, 1, 1, ATTENDANCE_LOG_COLS).setValues([ATTENDANCE_LOG_HEADERS]);
+  styleHeader_(sh.getRange(1, 1, 1, ATTENDANCE_LOG_COLS));
   sh.getRange('C:C').setNumberFormat('yyyy-mm-dd');
   sh.getRange('H:H').setNumberFormat('yyyy-mm-dd hh:mm');
   sh.setFrozenRows(1);
@@ -1945,8 +2335,29 @@ function setupTransferLog_() {
  */
 function setupBulkActionTemplates_() {
   const sh = ensureSheet_(BULK_TEMPLATES_SHEET);
-  if (String(sh.getRange('A1').getValue()).trim() === 'Bulk Action Templates') return;
-  buildBulkActionTemplatesContent_(sh);
+  if (String(sh.getRange('A1').getValue()).trim() !== 'Bulk Action Templates') {
+    buildBulkActionTemplatesContent_(sh);
+    return;
+  }
+  // v7.0: an existing sheet (set up by an older version) gets the new
+  // invite-only section appended at the bottom - nothing above it is touched.
+  const lastRow = sh.getLastRow();
+  const colA = lastRow ? sh.getRange(1, 1, lastRow, 1).getValues().flat().map(v => String(v).trim()) : [];
+  if (colA.indexOf(INVITE_TEMPLATE_TITLE) !== -1) return;
+
+  // getLastRow() only sees cells with content, so unused yellow input rows of
+  // section 3 could sit below it. Start after the last row that has ANY
+  // background colour too, so the new section never overlaps old input cells.
+  const bgs = sh.getRange(1, 1, sh.getMaxRows(), 5).getBackgrounds();
+  let lastStyledRow = 0;
+  bgs.forEach((r, i) => {
+    if (r.some(c => c && c.toLowerCase() !== '#ffffff')) lastStyledRow = i + 1;
+  });
+  const startRow = Math.max(lastRow, lastStyledRow) + 2;
+  const rowsNeeded = startRow + 45;
+  if (sh.getMaxRows() < rowsNeeded) sh.insertRowsAfter(sh.getMaxRows(), rowsNeeded - sh.getMaxRows());
+  sh.getRange(startRow, 1, 40, 5).clearDataValidations();
+  writeInviteOnlyTemplateSection_(sh, startRow);
 }
 
 function resetBulkActionTemplates() {
@@ -2017,9 +2428,49 @@ function buildBulkActionTemplatesContent_(sh) {
     blankRows: 25,
     columnValidations: { 2: dormValidation }
   });
+  row++;
+
+  // 4. Import Invite-Only Event (v7.0)
+  writeInviteOnlyTemplateSection_(sh, row);
 
   sh.setColumnWidths(1, 5, 160);
   sh.setFrozenRows(2);
+}
+
+/**
+ * v7.0: section 4 of BulkActionTemplates - the invite-only event template.
+ * Event details row, blank spacer row, then the invite list with a checkbox
+ * column. No italic example rows here on purpose: staff copy this whole
+ * block INCLUDING the headers (the importer needs them), so an example row
+ * would get pasted in as if it were real data.
+ */
+function writeInviteOnlyTemplateSection_(sh, startRow) {
+  const activeDorms = getActiveDormNames_();
+  const dormValidation = SpreadsheetApp.newDataValidation().requireValueInList(activeDorms, true).build();
+  const dateValidation = SpreadsheetApp.newDataValidation().requireDate().build();
+  const checkboxValidation = SpreadsheetApp.newDataValidation().requireCheckbox().build();
+
+  let row = writeTemplateSection_(sh, startRow, {
+    title: INVITE_TEMPLATE_TITLE,
+    note: 'For small events where only specific residents were invited. List everyone invited, tick "Attended?" for those who came ' +
+      '(or leave them all unticked and tick them on the event tab later). Copy from the "Event Name" header down to the last invitee - ' +
+      'headers included - and paste into the dialog. Only ticked residents get +1 Events Attended and +1 Eligible Events; ' +
+      'invited no-shows and everyone else are unaffected.',
+    headers: ['Event Name', 'Event Date', 'Venue'],
+    example: null,
+    blankRows: 1,
+    columnValidations: { 2: dateValidation }
+  });
+  row++; // blank spacer row before the invite list, same as section 3
+
+  row = writeTemplateSection_(sh, row, {
+    title: null,
+    headers: ['Invited ID', 'Dorm', 'Attended?'],
+    example: null,
+    blankRows: 30,
+    columnValidations: { 2: dormValidation, 3: checkboxValidation }
+  });
+  return row;
 }
 
 /** Writes one template section (optional title, header row, italic example row, then N blank editable rows) starting at startRow. Returns the next free row. */
@@ -2032,13 +2483,24 @@ function writeTemplateSection_(sh, startRow, opts) {
     row++;
   }
 
+  // v7.0: optional explanatory note under the title.
+  if (opts.note) {
+    sh.getRange(row, 1, 1, 5).merge().setValue(opts.note)
+      .setFontStyle('italic').setFontColor('#666666').setWrap(true).setVerticalAlignment('top');
+    sh.setRowHeight(row, 48);
+    row++;
+  }
+
   sh.getRange(row, 1, 1, numCols).setValues([opts.headers]);
   styleHeader_(sh.getRange(row, 1, 1, numCols));
   row++;
 
-  sh.getRange(row, 1, 1, opts.example.length).setValues([opts.example]);
-  sh.getRange(row, 1, 1, opts.example.length).setFontStyle('italic').setFontColor('#999999');
-  row++;
+  // v7.0: example row is now optional (pass example: null to skip it).
+  if (opts.example && opts.example.length) {
+    sh.getRange(row, 1, 1, opts.example.length).setValues([opts.example]);
+    sh.getRange(row, 1, 1, opts.example.length).setFontStyle('italic').setFontColor('#999999');
+    row++;
+  }
 
   if (opts.blankRows) {
     const dataStartRow = row;
@@ -2118,29 +2580,29 @@ function applyEventLookupFormulas_(sh) {
 function writeEventLog_(eventRows) {
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(EVENT_LOG_SHEET);
   sh.clearContents();
-  sh.getRange('A1:F1').setValues([['Event ID', 'Event Name', 'Event Date', 'Sheet Name', 'Created At', 'Applies To']]);
+  sh.getRange(1, 1, 1, EVENT_LOG_COLS).setValues([EVENT_LOG_HEADERS]);
   if (eventRows.length) {
     // Remove duplicate event IDs, keeping the last encountered entry.
     const byId = {};
     eventRows.forEach(row => byId[row[0]] = row);
     const uniqueRows = Object.keys(byId).sort().map(id => byId[id]);
-    sh.getRange(2, 1, uniqueRows.length, 6).setValues(uniqueRows);
+    sh.getRange(2, 1, uniqueRows.length, EVENT_LOG_COLS).setValues(uniqueRows);
   }
-  styleHeader_(sh.getRange('A1:F1'));
+  styleHeader_(sh.getRange(1, 1, 1, EVENT_LOG_COLS));
 }
 
 function writeAttendanceLog_(attendanceRows) {
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ATTENDANCE_LOG_SHEET);
   sh.clearContents();
-  sh.getRange('A1:I1').setValues([['Record ID', 'Event ID', 'Event Date', 'Event Name', 'Student ID', 'Dorm', 'Event Sheet', 'Logged At', 'Applies To']]);
+  sh.getRange(1, 1, 1, ATTENDANCE_LOG_COLS).setValues([ATTENDANCE_LOG_HEADERS]);
   if (attendanceRows.length) {
     attendanceRows.sort((a, b) => String(a[1]).localeCompare(String(b[1])) || String(a[4]).localeCompare(String(b[4])));
-    sh.getRange(2, 1, attendanceRows.length, 9).setValues(attendanceRows);
+    sh.getRange(2, 1, attendanceRows.length, ATTENDANCE_LOG_COLS).setValues(attendanceRows);
   }
-  styleHeader_(sh.getRange('A1:I1'));
+  styleHeader_(sh.getRange(1, 1, 1, ATTENDANCE_LOG_COLS));
 }
 
-function upsertEventLog_(eventId, eventName, eventDate, sheetName, dormScope) {
+function upsertEventLog_(eventId, eventName, eventDate, sheetName, dormScope, eventType) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(EVENT_LOG_SHEET) || ss.insertSheet(EVENT_LOG_SHEET);
   if (sh.getLastRow() < 1) setupEventLog_();
@@ -2148,10 +2610,10 @@ function upsertEventLog_(eventId, eventName, eventDate, sheetName, dormScope) {
   const lastRow = sh.getLastRow();
   const ids = lastRow > 1 ? sh.getRange(2, 1, lastRow - 1, 1).getValues().flat().map(String) : [];
   const idx = ids.indexOf(eventId);
-  const rowValues = [[eventId, eventName, eventDate, sheetName, new Date(), dormScope || '']];
+  const rowValues = [[eventId, eventName, eventDate, sheetName, new Date(), dormScope || '', eventType || '']];
 
   if (idx >= 0) {
-    sh.getRange(idx + 2, 1, 1, 6).setValues(rowValues);
+    sh.getRange(idx + 2, 1, 1, EVENT_LOG_COLS).setValues(rowValues);
   } else {
     sh.appendRow(rowValues[0]);
   }
